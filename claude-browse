@@ -1,0 +1,1294 @@
+#!/usr/bin/env python3
+"""claude-browse: unified browser for Claude Code sessions.
+
+Combines session browsing, full-text search, history viewing, and resume
+into a single interactive tool.
+
+Keys:
+  Session list:  j/k or arrows to navigate, Enter to select,
+                 s or / to search, q/Esc to quit
+  Action screen: r to resume (default Enter), h to view history,
+                 Esc to go back
+"""
+
+import argparse
+import curses
+import datetime
+import json
+import os
+import re
+import shlex
+import sys
+import textwrap
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+CLAUDE_CMD = os.environ.get("CLAUDE_BROWSE_CMD", "claude")
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def decode_project_dir(dirname):
+    """Convert encoded dir name back to a filesystem path.
+
+    Claude encodes paths by replacing '/' with '-', but directory names
+    themselves may contain hyphens.  We resolve ambiguity by walking the
+    filesystem: at each level we try the longest segment that matches an
+    existing directory, falling back to shorter splits.
+    """
+    # The encoded name starts with a leading '-' representing the root '/'.
+    if dirname.startswith("-"):
+        parts = dirname[1:].split("-")  # drop leading empty segment
+    else:
+        parts = dirname.split("-")
+
+    if not parts:
+        return "/" + dirname.replace("-", "/")
+
+    # Greedy left-to-right resolution against the real filesystem.
+    resolved = "/"
+    i = 0
+    while i < len(parts):
+        # Try joining as many consecutive parts as possible (longest match).
+        matched = False
+        for end in range(len(parts), i, -1):
+            candidate = "-".join(parts[i:end])
+            test_path = os.path.join(resolved, candidate)
+            if os.path.exists(test_path):
+                resolved = test_path
+                i = end
+                matched = True
+                break
+        if not matched:
+            # No filesystem match — just use the single part and keep going.
+            resolved = os.path.join(resolved, parts[i])
+            i += 1
+
+    return resolved
+
+
+def _extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        return " ".join(parts)
+    return ""
+
+
+def _strip_xml_tags(text):
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _parse_iso(ts):
+    if not ts:
+        return None
+    try:
+        ts = ts.replace("Z", "+00:00")
+        if "." in ts:
+            base, frac_and_tz = ts.split(".", 1)
+            frac_match = re.match(r"(\d+)(.*)", frac_and_tz)
+            if frac_match:
+                frac = frac_match.group(1)[:6].ljust(6, "0")
+                tz_part = frac_match.group(2)
+                ts = base + "." + frac + tz_part
+        return datetime.datetime.strptime(
+            ts.replace("+00:00", "+0000").replace(":", ""),
+            "%Y%m%dT%H%M%S.%f%z" if "." in ts else "%Y%m%dT%H%M%S%z",
+        )
+    except (ValueError, IndexError):
+        return None
+
+
+def relative_date(dt):
+    if dt is None:
+        return "unknown"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    delta = now - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return "{} min ago".format(minutes)
+    hours = minutes // 60
+    if hours < 24:
+        return "{} hr ago".format(hours)
+    days = delta.days
+    if days == 1:
+        return "yesterday"
+    if days < 30:
+        return "{} days ago".format(days)
+    return dt.strftime("%Y-%m-%d")
+
+
+def shorten_path(path, full=False):
+    home = str(Path.home())
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    if full or len(path) <= 50:
+        return path
+    parts = path.split("/")
+    if len(parts) <= 3:
+        return path
+    return parts[0] + "/" + parts[1] + "/.../" + parts[-1]
+
+
+def session_description(session, max_len=80):
+    desc = session.get("summary") or session.get("first_prompt") or session.get("last_prompt") or ""
+    desc = _strip_xml_tags(desc)
+    desc = " ".join(desc.split())
+    if len(desc) > max_len:
+        desc = desc[:max_len - 3] + "..."
+    return desc
+
+
+def wrap_text(text, width):
+    words = text.split()
+    lines = []
+    current = ""
+    for w in words:
+        if current and len(current) + 1 + len(w) > width:
+            lines.append(current)
+            current = w
+        else:
+            current = current + " " + w if current else w
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+def _parse_jsonl_meta(filepath):
+    """Parse a session .jsonl file and return session metadata dict."""
+    first_user_prompt = ""
+    last_prompt = ""
+    session_id = ""
+    timestamp = None
+    last_ts = None
+    msg_count = 0
+
+    try:
+        with open(str(filepath), "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                entry_type = entry.get("type", "")
+
+                if entry_type == "last-prompt":
+                    last_prompt = entry.get("lastPrompt", "")
+                    if not session_id:
+                        session_id = entry.get("sessionId", "")
+                    continue
+
+                if entry_type in ("user", "assistant"):
+                    msg_count += 1
+                    ts = _parse_iso(entry.get("timestamp", ""))
+                    if ts:
+                        if timestamp is None:
+                            timestamp = ts
+                        last_ts = ts
+
+                if entry_type == "user" and not entry.get("isMeta"):
+                    if not session_id:
+                        session_id = entry.get("sessionId", "")
+                    text = _extract_text(entry.get("message", {}).get("content", ""))
+                    text = _strip_xml_tags(text)
+                    if text and not first_user_prompt:
+                        first_user_prompt = " ".join(text.split())
+
+    except (IOError, OSError):
+        return None
+
+    if not session_id:
+        session_id = filepath.stem
+
+    if timestamp is None and last_ts is None:
+        try:
+            mtime = filepath.stat().st_mtime
+            last_ts = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        except OSError:
+            pass
+
+    return {
+        "session_id": session_id,
+        "first_prompt": first_user_prompt,
+        "last_prompt": last_prompt,
+        "summary": "",
+        "msg_count": msg_count,
+        "timestamp": timestamp,
+        "last_timestamp": last_ts,
+        "jsonl_path": str(filepath),
+    }
+
+
+def _load_sessions_index(index_path, project_dir_path):
+    result = {}
+    try:
+        with open(str(index_path), "r") as f:
+            data = json.load(f)
+        for entry in data.get("entries", []):
+            sid = entry.get("sessionId", "")
+            if sid:
+                jsonl_path = project_dir_path / (sid + ".jsonl")
+                result[sid] = {
+                    "session_id": sid,
+                    "summary": entry.get("summary", ""),
+                    "first_prompt": entry.get("firstPrompt", ""),
+                    "last_prompt": entry.get("lastPrompt", ""),
+                    "msg_count": entry.get("messageCount", 0),
+                    "timestamp": _parse_iso(entry.get("createdAt", "")),
+                    "last_timestamp": _parse_iso(entry.get("updatedAt", "")),
+                    "jsonl_path": str(jsonl_path),
+                }
+    except (IOError, OSError, json.JSONDecodeError):
+        pass
+    return result
+
+
+def collect_sessions():
+    sessions = []
+    if not CLAUDE_DIR.is_dir():
+        return sessions
+
+    for project_dir in CLAUDE_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        dir_name = project_dir.name
+        project_path = decode_project_dir(dir_name)
+
+        index_path = project_dir / "sessions-index.json"
+        indexed = _load_sessions_index(index_path, project_dir)
+        indexed_ids = set(indexed.keys())
+
+        for sid, info in indexed.items():
+            info["project_path"] = project_path
+            info["project_dir"] = dir_name
+            sessions.append(info)
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            sid = jsonl_file.stem
+            if sid in indexed_ids:
+                continue
+            info = _parse_jsonl_meta(jsonl_file)
+            if info:
+                info["project_path"] = project_path
+                info["project_dir"] = dir_name
+                sessions.append(info)
+
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# Filtering & sorting
+# ---------------------------------------------------------------------------
+
+_TRIVIAL_PROMPTS = {"hello", "hi", "hey", ""}
+
+
+def is_trivial(session):
+    if session.get("msg_count", 0) <= 3:
+        prompt = (session.get("summary") or session.get("first_prompt") or "").strip().lower()
+        prompt = _strip_xml_tags(prompt)
+        if prompt in _TRIVIAL_PROMPTS:
+            return True
+    return False
+
+
+def filter_sessions(sessions):
+    return [s for s in sessions if not is_trivial(s)]
+
+
+def sort_sessions(sessions):
+    def sort_key(s):
+        ts = s.get("last_timestamp") or s.get("timestamp")
+        if ts:
+            return ts
+        return datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+    return sorted(sessions, key=sort_key, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Full-text search (from claude-search)
+# ---------------------------------------------------------------------------
+
+def _scan_jsonl_for_search(filepath, terms):
+    """Parse a session .jsonl, searching for terms in all text content.
+
+    Returns session info dict augmented with search scoring, or None if no matches.
+    """
+    session_id = ""
+    first_user_prompt = ""
+    first_prompt_full = ""
+    last_prompt = ""
+    timestamp = None
+    last_ts = None
+    msg_count = 0
+    summary = ""
+    all_text_chunks = []
+
+    try:
+        with open(str(filepath), "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                entry_type = entry.get("type", "")
+
+                if entry_type == "last-prompt":
+                    last_prompt = entry.get("lastPrompt", "")
+                    if not session_id:
+                        session_id = entry.get("sessionId", "")
+                    all_text_chunks.append(last_prompt.lower())
+                    continue
+
+                if entry_type == "summary":
+                    summary = entry.get("summary", "")
+                    all_text_chunks.append(summary.lower())
+                    continue
+
+                if entry_type in ("user", "assistant"):
+                    msg_count += 1
+                    ts = _parse_iso(entry.get("timestamp", ""))
+                    if ts:
+                        if timestamp is None:
+                            timestamp = ts
+                        last_ts = ts
+
+                if entry_type == "user" and not entry.get("isMeta"):
+                    if not session_id:
+                        session_id = entry.get("sessionId", "")
+                    text = _extract_text(entry.get("message", {}).get("content", ""))
+                    text = _strip_xml_tags(text)
+                    if text:
+                        if not first_user_prompt:
+                            first_user_prompt = " ".join(text.split())
+                            first_prompt_full = first_user_prompt
+                        all_text_chunks.append(text.lower())
+
+                if entry_type == "assistant":
+                    text = _extract_text(entry.get("message", {}).get("content", ""))
+                    if text:
+                        all_text_chunks.append(text.lower())
+
+    except (IOError, OSError):
+        return None
+
+    if not session_id:
+        session_id = filepath.stem
+
+    full_text = " ".join(all_text_chunks)
+    terms_matched = 0
+    total_hits = 0
+
+    for term in terms:
+        count = full_text.count(term)
+        if count > 0:
+            terms_matched += 1
+            total_hits += count
+
+    if terms_matched == 0:
+        return None
+
+    if timestamp is None and last_ts is None:
+        try:
+            mtime = filepath.stat().st_mtime
+            last_ts = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+        except OSError:
+            pass
+
+    preview = first_prompt_full[:200] if first_prompt_full else "(no prompt)"
+
+    return {
+        "session_id": session_id,
+        "first_prompt": first_user_prompt[:80] if first_user_prompt else "",
+        "preview": preview,
+        "last_prompt": last_prompt,
+        "summary": summary,
+        "msg_count": msg_count,
+        "timestamp": timestamp,
+        "last_timestamp": last_ts,
+        "jsonl_path": str(filepath),
+        "terms_matched": terms_matched,
+        "total_hits": total_hits,
+    }
+
+
+def search_all_sessions(terms):
+    results = []
+    if not CLAUDE_DIR.is_dir():
+        return results
+
+    for project_dir in CLAUDE_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        dir_name = project_dir.name
+        project_path = decode_project_dir(dir_name)
+
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            info = _scan_jsonl_for_search(jsonl_file, terms)
+            if info:
+                info["project_path"] = project_path
+                info["project_dir"] = dir_name
+                results.append(info)
+
+    return sorted(results, key=lambda r: (r["terms_matched"], r["total_hits"]), reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# History extraction (from claude-history)
+# ---------------------------------------------------------------------------
+
+def _format_timestamp(ts_str):
+    dt = _parse_iso(ts_str)
+    if dt is None:
+        return ""
+    local_dt = dt.astimezone()
+    return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _extract_content_blocks(content):
+    blocks = []
+    if isinstance(content, str):
+        blocks.append(("text", content))
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                btype = part.get("type", "")
+                if btype == "text":
+                    blocks.append(("text", part.get("text", "")))
+                elif btype == "thinking":
+                    thinking_text = part.get("thinking", "")
+                    if thinking_text:
+                        blocks.append(("thinking", thinking_text))
+                elif btype == "tool_use":
+                    name = part.get("name", "unknown")
+                    inp = part.get("input", {})
+                    summary = _summarize_tool_use(name, inp)
+                    blocks.append(("tool_use", summary))
+                elif btype == "tool_result":
+                    tool_content = part.get("content", "")
+                    if isinstance(tool_content, list):
+                        for sub in tool_content:
+                            if isinstance(sub, dict) and sub.get("type") == "text":
+                                tool_content = sub.get("text", "")
+                                break
+                        else:
+                            tool_content = str(tool_content)
+                    is_err = part.get("is_error", False)
+                    prefix = "[tool error] " if is_err else "[tool result] "
+                    if isinstance(tool_content, str) and len(tool_content) > 500:
+                        tool_content = tool_content[:500] + "... (truncated)"
+                    blocks.append(("tool_result", prefix + str(tool_content)))
+                elif btype == "image":
+                    blocks.append(("text", "[image]"))
+                elif btype == "document":
+                    blocks.append(("text", "[document]"))
+            elif isinstance(part, str):
+                blocks.append(("text", part))
+    return blocks
+
+
+def _summarize_tool_use(name, inp):
+    if name in ("Read", "read"):
+        return "[tool: Read {}]".format(inp.get("file_path", ""))
+    elif name in ("Write", "write"):
+        return "[tool: Write {}]".format(inp.get("file_path", ""))
+    elif name in ("Edit", "edit"):
+        return "[tool: Edit {}]".format(inp.get("file_path", ""))
+    elif name in ("Bash", "bash"):
+        cmd = inp.get("command", "")
+        if len(cmd) > 120:
+            cmd = cmd[:117] + "..."
+        return "[tool: Bash] {}".format(cmd)
+    elif name in ("Glob", "glob"):
+        return "[tool: Glob {}]".format(inp.get("pattern", ""))
+    elif name in ("Grep", "grep"):
+        return "[tool: Grep '{}' {}]".format(inp.get("pattern", ""), inp.get("path", ""))
+    elif name == "Agent":
+        desc = inp.get("description", "")
+        return "[tool: Agent] {}".format(desc)
+    elif name in ("TodoWrite", "TaskCreate", "TaskUpdate"):
+        return "[tool: {}]".format(name)
+    else:
+        summary = "[tool: {}]".format(name)
+        for k, v in inp.items():
+            if isinstance(v, str) and v and len(v) < 100:
+                summary += " {}={}".format(k, v)
+                break
+        return summary
+
+
+def read_session_history(session, include_thinking=False, include_tools=True):
+    jsonl_path = session.get("jsonl_path", "")
+    if not jsonl_path:
+        project_dir = session.get("project_dir", "")
+        session_id = session.get("session_id", "")
+        jsonl_path = str(CLAUDE_DIR / project_dir / (session_id + ".jsonl"))
+
+    entries = []
+    try:
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                entry_type = entry.get("type", "")
+                if entry_type not in ("user", "assistant"):
+                    continue
+
+                if entry.get("isSidechain", False):
+                    continue
+
+                role = entry_type
+                timestamp = entry.get("timestamp", "")
+                content = entry.get("message", {}).get("content", "")
+                model = entry.get("message", {}).get("model", "")
+
+                blocks = _extract_content_blocks(content)
+
+                filtered = []
+                for btype, text in blocks:
+                    if btype == "thinking" and not include_thinking:
+                        continue
+                    if btype in ("tool_use", "tool_result") and not include_tools:
+                        continue
+                    filtered.append((btype, text))
+
+                if not filtered:
+                    continue
+
+                entries.append({
+                    "role": role,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "blocks": filtered,
+                })
+    except (IOError, OSError) as e:
+        print("Error reading session file: {}".format(e), file=sys.stderr)
+        return []
+
+    return entries
+
+
+def print_history(session, entries, use_color=True):
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    MAGENTA = "\033[35m"
+
+    def c(code, text):
+        if use_color:
+            return "{}{}{}".format(code, text, RESET)
+        return text
+
+    desc = session_description(session)
+    project = shorten_path(session.get("project_path", ""), full=True)
+    ts = session.get("timestamp")
+    last_ts = session.get("last_timestamp")
+
+    print(c(BOLD, "=" * 72))
+    print(c(BOLD, "Session: ") + session.get("session_id", ""))
+    print(c(BOLD, "Project: ") + project)
+    if desc:
+        print(c(BOLD, "Description: ") + desc)
+    if ts:
+        if hasattr(ts, 'astimezone'):
+            print(c(BOLD, "Started: ") + ts.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            print(c(BOLD, "Started: ") + _format_timestamp(str(ts)))
+    if last_ts:
+        if hasattr(last_ts, 'astimezone'):
+            print(c(BOLD, "Last activity: ") + last_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            print(c(BOLD, "Last activity: ") + _format_timestamp(str(last_ts)))
+    print(c(BOLD, "Messages: ") + str(len(entries)))
+    print(c(BOLD, "=" * 72))
+    print()
+
+    for entry in entries:
+        role = entry["role"]
+        timestamp = _format_timestamp(entry["timestamp"])
+
+        if role == "user":
+            header = c(GREEN + BOLD, "USER")
+        else:
+            model = entry.get("model", "")
+            model_short = model.split("/")[-1] if "/" in model else model
+            header = c(CYAN + BOLD, "ASSISTANT")
+            if model_short:
+                header += c(DIM, " [{}]".format(model_short))
+
+        if timestamp:
+            header += c(DIM, "  {}".format(timestamp))
+
+        print(header)
+        print(c(DIM, "-" * 40))
+
+        for btype, text in entry["blocks"]:
+            if btype == "thinking":
+                print(c(MAGENTA + DIM, "<thinking>"))
+                print(c(DIM, text))
+                print(c(MAGENTA + DIM, "</thinking>"))
+            elif btype == "tool_use":
+                print(c(YELLOW, text))
+            elif btype == "tool_result":
+                print(c(DIM, text))
+            else:
+                cleaned = re.sub(
+                    r"<system-reminder>.*?</system-reminder>",
+                    "",
+                    text,
+                    flags=re.DOTALL,
+                )
+                cleaned = cleaned.strip()
+                if cleaned:
+                    print(cleaned)
+
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Resume
+# ---------------------------------------------------------------------------
+
+def resume_session(session):
+    project_path = session["project_path"]
+    session_id = session["session_id"]
+    shell = os.environ.get("SHELL", "/bin/sh")
+    os.execvp(shell, [shell, "-ic", "cd {} && {} --resume {}".format(
+        shlex.quote(project_path), CLAUDE_CMD, session_id
+    )])
+
+
+# ---------------------------------------------------------------------------
+# Curses UI
+# ---------------------------------------------------------------------------
+
+def _draw_session_list(stdscr, sessions, selected, offset, max_y, max_x,
+                       header_text, search_mode=False, search_terms=None):
+    """Draw the session list view. Returns visible_entries count."""
+    LINES_PER_ENTRY = 3
+
+    # Header
+    try:
+        stdscr.addnstr(0, 0, header_text.ljust(max_x), max_x,
+                        curses.A_REVERSE | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    # Footer
+    if sessions:
+        footer_pos = " {}/{} ".format(selected + 1, len(sessions))
+    else:
+        footer_pos = " 0/0 "
+    if search_mode:
+        footer_keys = " \u2191\u2193/jk:nav  Enter:select  Esc:back to list  q:quit "
+    else:
+        footer_keys = " \u2191\u2193/jk:nav  Enter:select  s or /:search  q/Esc:quit "
+    footer = footer_pos + footer_keys
+    try:
+        stdscr.addnstr(max_y - 1, 0, footer.ljust(max_x), max_x, curses.A_REVERSE)
+    except curses.error:
+        pass
+
+    if not sessions:
+        msg = "  No sessions found."
+        try:
+            stdscr.addnstr(2, 0, msg, max_x)
+        except curses.error:
+            pass
+        return 0
+
+    content_height = max_y - 2
+    visible_entries = max(1, content_height // LINES_PER_ENTRY)
+
+    y = 1
+    for i in range(offset, min(offset + visible_entries, len(sessions))):
+        session = sessions[i]
+        is_sel = (i == selected)
+
+        ts = session.get("last_timestamp") or session.get("timestamp")
+        date_str = relative_date(ts)
+        path_str = shorten_path(session.get("project_path", ""))
+        desc = session_description(session)
+        meta_parts = ["msgs: {}".format(session.get("msg_count", 0))]
+        if search_terms and session.get("terms_matched"):
+            meta_parts.append("{}/{} terms, {} hits".format(
+                session["terms_matched"], len(search_terms), session["total_hits"]
+            ))
+        meta = "  ".join(meta_parts)
+
+        line1 = "  {} | {}".format(date_str, path_str)
+        line2 = "    {}".format(desc) if desc else "    (no description)"
+        line3 = "    {}".format(meta)
+
+        if is_sel:
+            attr = curses.color_pair(1) | curses.A_BOLD
+            for ln, text in enumerate([line1, line2, line3]):
+                if y + ln < max_y - 1:
+                    try:
+                        stdscr.addnstr(y + ln, 0, text.ljust(max_x), max_x, attr)
+                    except curses.error:
+                        pass
+        else:
+            if y < max_y - 1:
+                try:
+                    stdscr.addnstr(y, 0, line1, max_x, curses.color_pair(2))
+                except curses.error:
+                    pass
+            if y + 1 < max_y - 1:
+                try:
+                    stdscr.addnstr(y + 1, 0, line2, max_x)
+                except curses.error:
+                    pass
+            if y + 2 < max_y - 1:
+                try:
+                    stdscr.addnstr(y + 2, 0, line3, max_x, curses.A_DIM)
+                except curses.error:
+                    pass
+
+        y += LINES_PER_ENTRY
+
+    return visible_entries
+
+
+def _draw_action_screen(stdscr, session, max_y, max_x, action_selected):
+    """Draw the action screen for a selected session."""
+    # Header
+    header = " Session Details "
+    try:
+        stdscr.addnstr(0, 0, header.ljust(max_x), max_x,
+                        curses.A_REVERSE | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    y = 2
+
+    # Session details - use more screen real estate
+    project = shorten_path(session.get("project_path", ""), full=True)
+    ts = session.get("timestamp")
+    last_ts = session.get("last_timestamp")
+    sid = session.get("session_id", "")
+    msg_count = session.get("msg_count", 0)
+
+    details = [
+        ("Project:", project),
+        ("Session ID:", sid),
+    ]
+    if ts:
+        if hasattr(ts, 'astimezone'):
+            details.append(("Started:", ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")))
+        else:
+            details.append(("Started:", str(ts)))
+    if last_ts:
+        if hasattr(last_ts, 'astimezone'):
+            details.append(("Last active:", last_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")))
+        else:
+            details.append(("Last active:", str(last_ts)))
+    details.append(("Messages:", str(msg_count)))
+
+    for label, value in details:
+        if y < max_y - 4:
+            try:
+                stdscr.addnstr(y, 2, label, max_x - 2, curses.A_BOLD)
+                stdscr.addnstr(y, 2 + len(label) + 1, value, max_x - len(label) - 3)
+            except curses.error:
+                pass
+            y += 1
+
+    y += 1
+
+    # Show chat history preview from the start of the conversation
+    # Reserve 4 lines at bottom: blank, "Actions:" label, 2 action items
+    actions_height = 4
+    # footer takes 1 line, so usable bottom is max_y - 1
+    chat_bottom = max_y - 1 - actions_height
+    chat_width = max(20, max_x - 6)
+
+    if y < chat_bottom:
+        try:
+            stdscr.addnstr(y, 2, "Chat preview:", max_x - 2, curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+
+    # Load history entries (cached on the session dict to avoid re-reading)
+    if "_history_cache" not in session:
+        session["_history_cache"] = read_session_history(
+            session, include_thinking=False, include_tools=False
+        )
+    entries = session["_history_cache"]
+
+    if entries and y < chat_bottom:
+        try:
+            stdscr.addnstr(y, 2, "\u2500" * min(chat_width, max_x - 4),
+                            max_x - 2, curses.A_DIM)
+        except curses.error:
+            pass
+        y += 1
+
+    for entry in entries:
+        if y >= chat_bottom:
+            break
+
+        role = entry["role"]
+        if role == "user":
+            role_attr = curses.color_pair(3) | curses.A_BOLD  # green
+            role_label = "USER: "
+        else:
+            role_attr = curses.color_pair(4) | curses.A_BOLD  # cyan
+            role_label = "ASSISTANT: "
+
+        # Collect text blocks into one string
+        text_parts = []
+        for btype, text in entry["blocks"]:
+            if btype == "text":
+                cleaned = re.sub(
+                    r"<system-reminder>.*?</system-reminder>", "", text,
+                    flags=re.DOTALL,
+                )
+                cleaned = _strip_xml_tags(cleaned)
+                cleaned = " ".join(cleaned.split())
+                if cleaned:
+                    text_parts.append(cleaned)
+        full_text = " ".join(text_parts)
+        if not full_text:
+            continue
+
+        # First line: role label + start of text
+        first_line_width = max(10, chat_width - len(role_label))
+        if len(full_text) <= first_line_width:
+            first_line = full_text
+            remaining = ""
+        else:
+            first_line = full_text[:first_line_width]
+            remaining = full_text[first_line_width:]
+
+        if y < chat_bottom:
+            try:
+                stdscr.addnstr(y, 4, role_label, max_x - 4, role_attr)
+                stdscr.addnstr(y, 4 + len(role_label), first_line,
+                                max_x - 4 - len(role_label))
+            except curses.error:
+                pass
+            y += 1
+
+        # Continuation lines (indented to align with text after label)
+        if remaining:
+            cont_lines = wrap_text(remaining, chat_width)
+            # Limit continuation lines per message to keep it readable
+            max_cont = min(3, chat_bottom - y)
+            for i, cline in enumerate(cont_lines[:max_cont]):
+                if y >= chat_bottom:
+                    break
+                try:
+                    stdscr.addnstr(y, 4 + len(role_label), cline,
+                                    max_x - 4 - len(role_label))
+                except curses.error:
+                    pass
+                y += 1
+            if len(cont_lines) > max_cont and y < chat_bottom:
+                try:
+                    stdscr.addnstr(y, 4 + len(role_label), "...",
+                                    max_x - 4 - len(role_label), curses.A_DIM)
+                except curses.error:
+                    pass
+                y += 1
+
+    # If we ran out of entries before space, or no entries
+    if not entries and y < chat_bottom:
+        try:
+            stdscr.addnstr(y, 4, "(no messages found)", max_x - 4, curses.A_DIM)
+        except curses.error:
+            pass
+
+    # Action buttons - anchored to bottom
+    y = max_y - 1 - actions_height
+
+    actions = [
+        ("Resume session", "r"),
+        ("View history", "h"),
+    ]
+
+    if y < max_y - 1:
+        try:
+            stdscr.addnstr(y, 2, "Actions:", max_x - 2, curses.A_BOLD)
+        except curses.error:
+            pass
+        y += 1
+
+    for idx, (label, key) in enumerate(actions):
+        if y < max_y - 1:
+            if idx == action_selected:
+                attr = curses.color_pair(1) | curses.A_BOLD
+                text = " > {} ({}) ".format(label, key)
+            else:
+                attr = curses.A_DIM
+                text = "   {} ({})".format(label, key)
+            try:
+                if idx == action_selected:
+                    stdscr.addnstr(y, 2, text.ljust(max_x - 4), max_x - 4, attr)
+                else:
+                    stdscr.addnstr(y, 2, text, max_x - 2, attr)
+            except curses.error:
+                pass
+            y += 1
+
+    # Footer
+    footer = " \u2191\u2193/jk:switch  Enter/r:resume  h:history  Esc:back "
+    try:
+        stdscr.addnstr(max_y - 1, 0, footer.ljust(max_x), max_x, curses.A_REVERSE)
+    except curses.error:
+        pass
+
+
+def _curses_text_input(stdscr, prompt, max_y, max_x):
+    """Show a text input prompt at the bottom of the screen. Returns user input or None."""
+    curses.curs_set(1)
+    buf = ""
+
+    while True:
+        # Draw input bar
+        input_line = "{} {}".format(prompt, buf)
+        try:
+            stdscr.addnstr(max_y - 2, 0, input_line.ljust(max_x), max_x,
+                            curses.A_BOLD)
+            stdscr.move(max_y - 2, len(prompt) + 1 + len(buf))
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+
+        if key == 27:  # Esc
+            curses.curs_set(0)
+            return None
+        elif key in (curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            return buf.strip()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= key <= 126:
+            buf += chr(key)
+
+
+# Actions returned from the UI
+ACTION_RESUME = "resume"
+ACTION_HISTORY = "history"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Browse, search, and resume Claude Code sessions."
+    )
+    parser.add_argument("-n", type=int, default=0, metavar="N",
+                        help="Limit to N results")
+    parser.add_argument("-s", type=str, default="", metavar="QUERY",
+                        help="Start with search results for QUERY")
+    parser.add_argument("--json", action="store_true", dest="json_out",
+                        help="Output session list as JSON (non-interactive)")
+    parser.add_argument("--full-path", action="store_true",
+                        help="Don't shorten paths")
+    parser.add_argument("--session", type=str, default="", metavar="ID",
+                        help="Jump directly to action screen for session ID")
+    parser.add_argument("--history", action="store_true",
+                        help="With --session, print history directly")
+    parser.add_argument("--no-tools", action="store_true",
+                        help="Hide tool use/result blocks in history output")
+    parser.add_argument("--thinking", action="store_true",
+                        help="Include thinking blocks in history output")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable colored output")
+
+    args = parser.parse_args()
+
+    # Collect sessions
+    sessions = collect_sessions()
+    sessions = filter_sessions(sessions)
+    sessions = sort_sessions(sessions)
+
+    if args.n > 0:
+        sessions = sessions[:args.n]
+
+    # Direct session ID mode
+    if args.session:
+        chosen = None
+        for s in sessions:
+            if s["session_id"] == args.session or s["session_id"].startswith(args.session):
+                chosen = s
+                break
+        if not chosen:
+            print("Session '{}' not found.".format(args.session), file=sys.stderr)
+            sys.exit(1)
+
+        if args.history:
+            entries = read_session_history(
+                chosen,
+                include_thinking=args.thinking,
+                include_tools=not args.no_tools,
+            )
+            if not entries:
+                print("No messages found in session.", file=sys.stderr)
+                sys.exit(1)
+            use_color = sys.stdout.isatty() and not args.no_color
+            print_history(chosen, entries, use_color=use_color)
+        else:
+            resume_session(chosen)
+        return
+
+    # JSON output mode
+    if args.json_out:
+        output = []
+        for s in sessions:
+            ts = s.get("last_timestamp") or s.get("timestamp")
+            output.append({
+                "session_id": s["session_id"],
+                "project_path": s.get("project_path", ""),
+                "display_path": shorten_path(s.get("project_path", ""), full=args.full_path),
+                "description": session_description(s),
+                "msg_count": s.get("msg_count", 0),
+                "timestamp": ts.isoformat() if ts else None,
+                "first_prompt": s.get("first_prompt", ""),
+                "last_prompt": s.get("last_prompt", ""),
+                "summary": s.get("summary", ""),
+            })
+        print(json.dumps(output, indent=2))
+        return
+
+    if not sessions:
+        print("No sessions found.", file=sys.stderr)
+        sys.exit(1)
+
+    if not sys.stdout.isatty():
+        # Non-interactive fallback
+        for s in sessions:
+            ts = s.get("last_timestamp") or s.get("timestamp")
+            date_str = relative_date(ts)
+            path_str = shorten_path(s.get("project_path", ""), full=args.full_path)
+            desc = session_description(s)
+            print("{} | {} | msgs: {}".format(date_str, path_str, s.get("msg_count", 0)))
+            if desc:
+                print("  {}".format(desc))
+            print()
+        return
+
+    # If -s was given, start in search mode
+    initial_search_terms = None
+    if args.s:
+        terms = [t.lower() for t in args.s.split()]
+        print("Searching...", file=sys.stderr, end="", flush=True)
+        results = search_all_sessions(terms)
+        print(" {} results.".format(len(results)), file=sys.stderr)
+        if results:
+            sessions = results
+            initial_search_terms = terms
+
+    # For the curses UI, we need both the full list and any initial search results
+    if initial_search_terms:
+        all_sessions = collect_sessions()
+        all_sessions = filter_sessions(all_sessions)
+        all_sessions = sort_sessions(all_sessions)
+    else:
+        all_sessions = sessions
+
+    def _run_ui(stdscr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+
+        # State
+        if initial_search_terms:
+            mode = "search_results"
+            display_sessions = sessions  # already search results
+            search_terms = initial_search_terms
+        else:
+            mode = "list"
+            display_sessions = all_sessions
+            search_terms = None
+
+        selected = 0
+        offset = 0
+        action_selected = 0
+        chosen_session = None
+
+        LINES_PER_ENTRY = 3
+
+        while True:
+            stdscr.erase()
+            max_y, max_x = stdscr.getmaxyx()
+
+            if mode == "action":
+                _draw_action_screen(stdscr, chosen_session, max_y, max_x, action_selected)
+                stdscr.refresh()
+                key = stdscr.getch()
+
+                if key == 27:
+                    mode = "search_results" if search_terms else "list"
+                    chosen_session = None
+                    action_selected = 0
+                elif key in (curses.KEY_UP, ord("k")):
+                    action_selected = max(0, action_selected - 1)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    action_selected = min(1, action_selected + 1)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    if action_selected == 0:
+                        return (chosen_session, ACTION_RESUME)
+                    else:
+                        return (chosen_session, ACTION_HISTORY)
+                elif key == ord("r"):
+                    return (chosen_session, ACTION_RESUME)
+                elif key == ord("h"):
+                    return (chosen_session, ACTION_HISTORY)
+                elif key == ord("q"):
+                    return (None, None)
+                continue
+
+            # List / search results
+            if mode == "search_results":
+                header = " Search: {} ({} results) ".format(
+                    " ".join(search_terms) if search_terms else "", len(display_sessions)
+                )
+            else:
+                header = " Claude Sessions ({} total) ".format(len(display_sessions))
+
+            visible_entries = _draw_session_list(
+                stdscr, display_sessions, selected, offset, max_y, max_x,
+                header, search_mode=(mode == "search_results"),
+                search_terms=search_terms,
+            )
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if mode == "search_results" and key == 27:
+                mode = "list"
+                display_sessions = all_sessions
+                selected = 0
+                offset = 0
+                search_terms = None
+                continue
+
+            if key == ord("q"):
+                return (None, None)
+            if key == 27 and mode == "list":
+                return (None, None)
+
+            if key in (curses.KEY_DOWN, ord("j")):
+                if display_sessions and selected < len(display_sessions) - 1:
+                    selected += 1
+            elif key in (curses.KEY_UP, ord("k")):
+                if selected > 0:
+                    selected -= 1
+            elif key in (curses.KEY_NPAGE,):
+                if display_sessions:
+                    selected = min(selected + visible_entries, len(display_sessions) - 1)
+            elif key in (curses.KEY_PPAGE,):
+                selected = max(selected - visible_entries, 0)
+            elif key in (curses.KEY_HOME, ord("g")):
+                selected = 0
+            elif key in (curses.KEY_END, ord("G")):
+                if display_sessions:
+                    selected = len(display_sessions) - 1
+
+            elif key in (ord("s"), ord("/")):
+                query = _curses_text_input(stdscr, "Search:", max_y, max_x)
+                if query:
+                    stdscr.erase()
+                    try:
+                        stdscr.addnstr(max_y // 2, 2,
+                                       "Searching for: {} ...".format(query), max_x - 2)
+                    except curses.error:
+                        pass
+                    stdscr.refresh()
+
+                    terms = [t.lower() for t in query.split()]
+                    results = search_all_sessions(terms)
+                    if results:
+                        display_sessions = results
+                        search_terms = terms
+                        mode = "search_results"
+                        selected = 0
+                        offset = 0
+                    else:
+                        try:
+                            stdscr.addnstr(max_y // 2 + 1, 2,
+                                           "No results found. Press any key.",
+                                           max_x - 2, curses.A_BOLD)
+                        except curses.error:
+                            pass
+                        stdscr.refresh()
+                        stdscr.getch()
+
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if display_sessions:
+                    chosen_session = display_sessions[selected]
+                    mode = "action"
+                    action_selected = 0
+
+            if selected < offset:
+                offset = selected
+            elif visible_entries > 0 and selected >= offset + visible_entries:
+                offset = selected - visible_entries + 1
+
+    result = curses.wrapper(_run_ui)
+    session, action = result if result else (None, None)
+
+    if not session:
+        return
+
+    if action == ACTION_RESUME:
+        resume_session(session)
+    elif action == ACTION_HISTORY:
+        entries = read_session_history(
+            session,
+            include_thinking=args.thinking,
+            include_tools=not args.no_tools,
+        )
+        if not entries:
+            print("No messages found in session.", file=sys.stderr)
+            sys.exit(1)
+        use_color = sys.stdout.isatty() and not args.no_color
+        print_history(session, entries, use_color=use_color)
+
+
+if __name__ == "__main__":
+    main()
