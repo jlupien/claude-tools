@@ -1,12 +1,45 @@
 #!/usr/bin/env python3
-"""claude-browse: unified browser for Claude Code sessions.
+"""claude-browse: Browse, search, and resume Claude Code sessions.
 
-Combines session browsing, full-text search, history viewing, and resume
-into a single interactive tool.
+An interactive TUI for navigating your Claude Code conversation history.
+Lists all sessions across projects with full-text search, conversation
+history viewing, and one-key resume.
 
-Keys:
-  Session list:  j/k or arrows to navigate, Enter to select,
-                 s or / to search, q/Esc to quit
+Requirements:
+  - Python 3.7+
+  - Claude Code CLI installed and on your PATH
+
+Environment variables:
+  CLAUDE_BROWSE_CMD   Command used to resume sessions (default: "claude").
+                      Set this if your Claude Code binary has a different
+                      name or path, or to pass default CLI flags.
+                      Examples:
+                        CLAUDE_BROWSE_CMD="claude-code"
+                        CLAUDE_BROWSE_CMD="claude --dangerously-skip-permissions"
+
+Usage:
+  claude-browse                    Interactive session browser
+  claude-browse -s "search term"   Open with search results
+  claude-browse -n 20              Show only the 20 most recent sessions
+  claude-browse --json             Dump session list as JSON (non-interactive)
+  claude-browse --session ID       Jump to a specific session by ID
+  claude-browse --session ID --history   Print session history to stdout
+
+Flags:
+  -n N              Limit to N most recent sessions
+  -s QUERY          Pre-fill search with QUERY
+  --json            Output session list as JSON and exit
+  --full-path       Show full project paths instead of shortened ones
+  --session ID      Jump directly to a session (prefix match supported)
+  --history         With --session, print conversation history to stdout
+  --no-tools        Hide tool use/result blocks in history output
+  --thinking        Include thinking blocks in history output
+  --no-color        Disable colored output
+
+Interactive keys:
+  Session list:  j/k or Up/Down to navigate, Enter to select,
+                 s or / to search, g/G for top/bottom,
+                 PgUp/PgDn to page, q or Esc to quit
   Action screen: r to resume (default Enter), h to view history,
                  Esc to go back
 """
