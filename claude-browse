@@ -103,6 +103,32 @@ def decode_project_dir(dirname):
     return resolved
 
 
+def read_session_cwd(filepath):
+    """Return the real working directory recorded inside a session .jsonl.
+
+    Claude Code encodes a project's path into the directory name by replacing
+    '/', '_', and '.' all with '-', which is irreversible.  Each session entry,
+    however, records the true ``cwd``.  This reads the first one available and
+    is the authoritative source for resuming into the correct directory.
+    """
+    try:
+        with open(str(filepath), "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = entry.get("cwd")
+                if cwd:
+                    return cwd
+    except (IOError, OSError):
+        pass
+    return None
+
+
 def _extract_text(content):
     if isinstance(content, str):
         return content
@@ -209,6 +235,7 @@ def _parse_jsonl_meta(filepath):
     timestamp = None
     last_ts = None
     msg_count = 0
+    cwd = ""
 
     try:
         with open(str(filepath), "r") as f:
@@ -220,6 +247,9 @@ def _parse_jsonl_meta(filepath):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                if not cwd and entry.get("cwd"):
+                    cwd = entry["cwd"]
 
                 entry_type = entry.get("type", "")
 
@@ -267,6 +297,7 @@ def _parse_jsonl_meta(filepath):
         "timestamp": timestamp,
         "last_timestamp": last_ts,
         "jsonl_path": str(filepath),
+        "cwd": cwd,
     }
 
 
@@ -321,7 +352,7 @@ def collect_sessions():
                 continue
             info = _parse_jsonl_meta(jsonl_file)
             if info:
-                info["project_path"] = project_path
+                info["project_path"] = info.get("cwd") or project_path
                 info["project_dir"] = dir_name
                 sessions.append(info)
 
@@ -374,6 +405,7 @@ def _scan_jsonl_for_search(filepath, terms):
     last_ts = None
     msg_count = 0
     summary = ""
+    cwd = ""
     all_text_chunks = []
 
     try:
@@ -386,6 +418,9 @@ def _scan_jsonl_for_search(filepath, terms):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                if not cwd and entry.get("cwd"):
+                    cwd = entry["cwd"]
 
                 entry_type = entry.get("type", "")
 
@@ -463,6 +498,7 @@ def _scan_jsonl_for_search(filepath, terms):
         "timestamp": timestamp,
         "last_timestamp": last_ts,
         "jsonl_path": str(filepath),
+        "cwd": cwd,
         "terms_matched": terms_matched,
         "total_hits": total_hits,
     }
@@ -483,7 +519,7 @@ def search_all_sessions(terms):
         for jsonl_file in project_dir.glob("*.jsonl"):
             info = _scan_jsonl_for_search(jsonl_file, terms)
             if info:
-                info["project_path"] = project_path
+                info["project_path"] = info.get("cwd") or project_path
                 info["project_dir"] = dir_name
                 results.append(info)
 
@@ -716,7 +752,14 @@ def print_history(session, entries, use_color=True):
 # ---------------------------------------------------------------------------
 
 def resume_session(session):
-    project_path = session["project_path"]
+    # The decoded directory name is lossy ('/', '_', '.' all become '-'), so
+    # prefer the true cwd recorded inside the session file when available.
+    project_path = session.get("cwd")
+    jsonl_path = session.get("jsonl_path")
+    if not project_path and jsonl_path:
+        project_path = read_session_cwd(jsonl_path)
+    if not project_path:
+        project_path = session["project_path"]
     session_id = session["session_id"]
     shell = os.environ.get("SHELL", "/bin/sh")
     os.execvp(shell, [shell, "-ic", "cd {} && {} --resume {}".format(
