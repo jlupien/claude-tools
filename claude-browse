@@ -37,6 +37,10 @@ Flags:
   --no-tools        Hide tool use/result blocks in history output
   --thinking        Include thinking blocks in history output
   --no-color        Disable colored output
+  --no-tables       Leave markdown tables as-is in history output
+
+History output renders markdown tables as box-drawn tables sized to the
+terminal, the way Claude Code displays them in a live conversation.
 
 Interactive keys:
   Session list:  j/k or Up/Down to navigate, Enter to select,
@@ -53,8 +57,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import textwrap
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -529,6 +535,275 @@ def search_all_sessions(terms):
 
 
 # ---------------------------------------------------------------------------
+# Markdown table rendering
+#
+# Turns GitHub-flavored markdown tables in message text into box-drawn tables
+# with wrapped cells, the way Claude Code renders them in the terminal.
+# ---------------------------------------------------------------------------
+
+_BOLD = "\033[1m"
+_ITALIC = "\033[3m"
+_CODE = "\033[36m"
+_RESET = "\033[0m"
+
+_ATTR_CODES = {"bold": _BOLD, "italic": _ITALIC, "code": _CODE}
+
+# **bold** / __bold__, `code`, *italic* / _italic_
+_INLINE_RE = re.compile(
+    r"(\*\*|__)(?P<bold>.+?)\1"
+    r"|(?P<ticks>`+)(?P<code>.+?)(?P=ticks)"
+    r"|(?<![\w*])[*_](?P<italic>[^*_\s](?:[^*_]*[^*_\s])?)[*_](?![\w*])",
+    re.DOTALL,
+)
+
+_ALIGN_CELL_RE = re.compile(r"^:?-+:?$")
+
+
+def _display_width(text):
+    """Terminal column width of a string, accounting for wide/combining chars."""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _inline_runs(text):
+    """Split text into [(text, attr)] runs, where attr is '', bold, italic or code."""
+    runs = []
+    pos = 0
+    for m in _INLINE_RE.finditer(text):
+        if m.start() > pos:
+            runs.append((text[pos:m.start()], ""))
+        for attr in ("bold", "code", "italic"):
+            if m.group(attr) is not None:
+                runs.append((m.group(attr), attr))
+                break
+        pos = m.end()
+    if pos < len(text):
+        runs.append((text[pos:], ""))
+    return runs
+
+
+def _runs_to_clusters(runs):
+    """Group runs into clusters of [(word, attr)] parts with no space between them.
+
+    A cluster is what would be one "word" if the markup were stripped, so
+    `**Downtown**, walk` yields the clusters [Downtown, ","] and [walk].
+    """
+    clusters = []
+    glue_next = False
+    for text, attr in runs:
+        words = text.split()
+        if not words:
+            if text:
+                glue_next = False
+            continue
+        for idx, word in enumerate(words):
+            glued = (idx == 0 and glue_next and not text[:1].isspace()
+                     and bool(clusters))
+            if glued:
+                clusters[-1].append((word, attr))
+            else:
+                clusters.append([(word, attr)])
+        glue_next = not text[-1:].isspace()
+    return clusters
+
+
+def _cluster_width(cluster):
+    return sum(_display_width(word) for word, _ in cluster)
+
+
+def _wrap_clusters(clusters, width):
+    """Greedy word wrap over clusters. Returns a list of lines of clusters."""
+    if width < 1:
+        width = 1
+
+    # A cluster too wide to ever fit breaks apart at its markup boundaries.
+    queue = []
+    for cluster in clusters:
+        if len(cluster) > 1 and _cluster_width(cluster) > width:
+            queue.extend([[part] for part in cluster])
+        else:
+            queue.append(cluster)
+
+    lines = []
+    current = []
+    current_width = 0
+    for cluster in queue:
+        cluster_width = _cluster_width(cluster)
+        # Still too wide: hard-break the single remaining word.
+        while cluster_width > width:
+            word, attr = cluster[0]
+            head, head_width = "", 0
+            for ch in word:
+                ch_width = _display_width(ch)
+                if head_width + ch_width > width:
+                    break
+                head += ch
+                head_width += ch_width
+            if not head:
+                head = word[0]
+            if current:
+                lines.append(current)
+                current, current_width = [], 0
+            lines.append([[(head, attr)]])
+            word = word[len(head):]
+            cluster = [(word, attr)]
+            cluster_width = _display_width(word)
+        if not cluster[0][0]:
+            continue
+        extra = cluster_width + (1 if current else 0)
+        if current and current_width + extra > width:
+            lines.append(current)
+            current, current_width = [], 0
+            extra = cluster_width
+        current.append(cluster)
+        current_width += extra
+    if current:
+        lines.append(current)
+    return lines or [[]]
+
+
+def _render_cluster_line(line, width, align, use_color):
+    """Render one wrapped line of clusters, padded to `width` columns."""
+    plain = " ".join("".join(word for word, _ in cl) for cl in line)
+    pad = max(0, width - _display_width(plain))
+    if align == "right":
+        left, right = pad, 0
+    elif align == "center":
+        left, right = pad // 2, pad - pad // 2
+    else:
+        left, right = 0, pad
+
+    if use_color:
+        rendered = []
+        for cluster in line:
+            parts = []
+            for word, attr in cluster:
+                code = _ATTR_CODES.get(attr)
+                parts.append("{}{}{}".format(code, word, _RESET) if code else word)
+            rendered.append("".join(parts))
+        body = " ".join(rendered)
+    else:
+        body = plain
+    return " " * left + body + " " * right
+
+
+def _split_table_row(line):
+    """Split a markdown table row into its cells."""
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    cells = re.split(r"(?<!\\)\|", line)
+    return [c.replace("\\|", "|").strip() for c in cells]
+
+
+def _is_separator_row(cells):
+    return bool(cells) and all(_ALIGN_CELL_RE.match(c) for c in cells)
+
+
+def _cell_alignment(spec):
+    left = spec.startswith(":")
+    right = spec.endswith(":")
+    if left and right:
+        return "center"
+    if right:
+        return "right"
+    return "left"
+
+
+def _format_table(rows, aligns, total_width, use_color, indent="  "):
+    """Render parsed table rows as a box-drawn table."""
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    aligns = (aligns + ["left"] * ncols)[:ncols]
+
+    cell_clusters = [[_runs_to_clusters(_inline_runs(c)) for c in row] for row in rows]
+
+    # Natural width: the widest a cell would be if it were never wrapped.
+    natural = []
+    for col in range(ncols):
+        widest = 1
+        for row in cell_clusters:
+            plain = " ".join("".join(w for w, _ in cl) for cl in row[col])
+            widest = max(widest, _display_width(plain))
+        natural.append(widest)
+
+    # Shrink the widest columns until the table fits the terminal.
+    avail = total_width - len(indent) - (ncols + 1) - 2 * ncols
+    widths = natural[:]
+    while sum(widths) > avail:
+        widest = max(widths)
+        if widest <= 3:
+            break
+        widths[widths.index(widest)] = widest - 1
+
+    def rule(left, mid, right):
+        return indent + left + mid.join("─" * (w + 2) for w in widths) + right
+
+    out = [rule("┌", "┬", "┐")]
+    for idx, row in enumerate(cell_clusters):
+        is_header = idx == 0
+        wrapped = [_wrap_clusters(row[col], widths[col]) for col in range(ncols)]
+        height = max(len(w) for w in wrapped)
+        for line_idx in range(height):
+            cells = []
+            for col in range(ncols):
+                line = wrapped[col][line_idx] if line_idx < len(wrapped[col]) else []
+                align = "center" if is_header and aligns[col] == "left" else aligns[col]
+                cells.append(" " + _render_cluster_line(
+                    line, widths[col], align, use_color) + " ")
+            out.append(indent + "│" + "│".join(cells) + "│")
+        if idx < len(cell_clusters) - 1:
+            out.append(rule("├", "┼", "┤"))
+    out.append(rule("└", "┴", "┘"))
+    return out
+
+
+def render_markdown_tables(text, total_width=None, use_color=True):
+    """Replace markdown tables in `text` with box-drawn ones. Other text is kept."""
+    if "|" not in text:
+        return text
+    if total_width is None:
+        total_width = terminal_width()
+
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        header = lines[i]
+        if "|" in header and i + 1 < len(lines):
+            header_cells = _split_table_row(header)
+            sep_cells = _split_table_row(lines[i + 1])
+            if (len(header_cells) > 1 and _is_separator_row(sep_cells)
+                    and len(sep_cells) == len(header_cells)):
+                aligns = [_cell_alignment(c) for c in sep_cells]
+                rows = [header_cells]
+                j = i + 2
+                while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                    rows.append(_split_table_row(lines[j]))
+                    j += 1
+                out.extend(_format_table(rows, aligns, total_width, use_color))
+                i = j
+                continue
+        out.append(header)
+        i += 1
+    return "\n".join(out)
+
+
+def terminal_width(default=100):
+    try:
+        width = shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        width = default
+    return max(40, min(width, 200))
+
+
+# ---------------------------------------------------------------------------
 # History extraction (from claude-history)
 # ---------------------------------------------------------------------------
 
@@ -669,7 +944,7 @@ def read_session_history(session, include_thinking=False, include_tools=True):
     return entries
 
 
-def print_history(session, entries, use_color=True):
+def print_history(session, entries, use_color=True, render_tables=True):
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
@@ -744,6 +1019,9 @@ def print_history(session, entries, use_color=True):
                 )
                 cleaned = cleaned.strip()
                 if cleaned:
+                    if render_tables:
+                        cleaned = render_markdown_tables(
+                            cleaned, use_color=use_color)
                     print(cleaned)
 
         print()
@@ -1123,6 +1401,8 @@ def main():
                         help="Include thinking blocks in history output")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored output")
+    parser.add_argument("--no-tables", action="store_true",
+                        help="Leave markdown tables as-is in history output")
 
     args = parser.parse_args()
 
@@ -1155,7 +1435,8 @@ def main():
                 print("No messages found in session.", file=sys.stderr)
                 sys.exit(1)
             use_color = sys.stdout.isatty() and not args.no_color
-            print_history(chosen, entries, use_color=use_color)
+            print_history(chosen, entries, use_color=use_color,
+                          render_tables=not args.no_tables)
         else:
             resume_session(chosen, fork=args.fork)
         return
@@ -1375,7 +1656,8 @@ def main():
             print("No messages found in session.", file=sys.stderr)
             sys.exit(1)
         use_color = sys.stdout.isatty() and not args.no_color
-        print_history(session, entries, use_color=use_color)
+        print_history(session, entries, use_color=use_color,
+                      render_tables=not args.no_tables)
 
 
 if __name__ == "__main__":

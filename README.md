@@ -32,6 +32,8 @@ claude-browse --session ID --fork      # fork a session into a new session ID
 claude-browse --json                   # dump session list as JSON
 ```
 
+History output renders markdown tables as box-drawn tables sized to your terminal (with bold/italic/code spans as ANSI styling), matching how Claude Code displays them in a live conversation. Pass `--no-tables` to leave the raw markdown alone.
+
 **Environment variables:**
 
 - `CLAUDE_BROWSE_CMD` — command used to resume sessions (default: `claude`). Set this if your binary has a different name or to pass default CLI flags, e.g. `CLAUDE_BROWSE_CMD="claude --dangerously-skip-permissions"`.
