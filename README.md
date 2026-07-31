@@ -6,9 +6,9 @@ A collection of command-line tools for working with [Claude Code](https://docs.a
 
 ### claude-browse
 
-Interactive TUI for browsing, searching, and resuming Claude Code sessions.
+Interactive TUI for browsing, searching, resuming, and forking Claude Code sessions.
 
-Reads your local `~/.claude/projects` directory and presents all sessions across projects in a navigable interface with full-text search, conversation history viewing, and one-key resume.
+Reads your local `~/.claude/projects` directory and presents all sessions across projects in a navigable interface with full-text search, conversation history viewing, and one-key resume or fork (resume into a new session ID, leaving the original untouched).
 
 **Install:**
 
@@ -28,6 +28,7 @@ claude-browse                          # interactive session browser
 claude-browse -s "search term"         # open with search results
 claude-browse -n 20                    # show 20 most recent sessions
 claude-browse --session ID --history   # print a session's conversation to stdout
+claude-browse --session ID --fork      # fork a session into a new session ID
 claude-browse --json                   # dump session list as JSON
 ```
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""claude-browse: Browse, search, and resume Claude Code sessions.
+"""claude-browse: Browse, search, resume, and fork Claude Code sessions.
 
 An interactive TUI for navigating your Claude Code conversation history.
 Lists all sessions across projects with full-text search, conversation
-history viewing, and one-key resume.
+history viewing, and one-key resume or fork.
 
 Requirements:
   - Python 3.7+
@@ -24,6 +24,7 @@ Usage:
   claude-browse --json             Dump session list as JSON (non-interactive)
   claude-browse --session ID       Jump to a specific session by ID
   claude-browse --session ID --history   Print session history to stdout
+  claude-browse --session ID --fork      Fork a session into a new session ID
 
 Flags:
   -n N              Limit to N most recent sessions
@@ -32,6 +33,7 @@ Flags:
   --full-path       Show full project paths instead of shortened ones
   --session ID      Jump directly to a session (prefix match supported)
   --history         With --session, print conversation history to stdout
+  --fork            With --session, resume as a new forked session
   --no-tools        Hide tool use/result blocks in history output
   --thinking        Include thinking blocks in history output
   --no-color        Disable colored output
@@ -40,8 +42,8 @@ Interactive keys:
   Session list:  j/k or Up/Down to navigate, Enter to select,
                  s or / to search, g/G for top/bottom,
                  PgUp/PgDn to page, q or Esc to quit
-  Action screen: r to resume (default Enter), h to view history,
-                 Esc to go back
+  Action screen: r to resume (default Enter), f to fork into a new
+                 session, h to view history, Esc to go back
 """
 
 import argparse
@@ -751,7 +753,8 @@ def print_history(session, entries, use_color=True):
 # Resume
 # ---------------------------------------------------------------------------
 
-def resume_session(session):
+def resume_session(session, fork=False):
+    """Resume a session in place, or fork it into a new session ID."""
     # The decoded directory name is lossy ('/', '_', '.' all become '-'), so
     # prefer the true cwd recorded inside the session file when available.
     project_path = session.get("cwd")
@@ -762,14 +765,30 @@ def resume_session(session):
         project_path = session["project_path"]
     session_id = session["session_id"]
     shell = os.environ.get("SHELL", "/bin/sh")
-    os.execvp(shell, [shell, "-ic", "cd {} && {} --resume {}".format(
-        shlex.quote(project_path), CLAUDE_CMD, session_id
+    resume_flags = "--resume {}".format(session_id)
+    if fork:
+        resume_flags += " --fork-session"
+    os.execvp(shell, [shell, "-ic", "cd {} && {} {}".format(
+        shlex.quote(project_path), CLAUDE_CMD, resume_flags
     )])
 
 
 # ---------------------------------------------------------------------------
 # Curses UI
 # ---------------------------------------------------------------------------
+
+# Actions returned from the UI
+ACTION_RESUME = "resume"
+ACTION_FORK = "fork"
+ACTION_HISTORY = "history"
+
+# (label, hotkey, action) in the order shown on the action screen
+ACTIONS = [
+    ("Resume session", "r", ACTION_RESUME),
+    ("Fork session", "f", ACTION_FORK),
+    ("View history", "h", ACTION_HISTORY),
+]
+
 
 def _draw_session_list(stdscr, sessions, selected, offset, max_y, max_x,
                        header_text, search_mode=False, search_terms=None):
@@ -906,8 +925,8 @@ def _draw_action_screen(stdscr, session, max_y, max_x, action_selected):
     y += 1
 
     # Show chat history preview from the start of the conversation
-    # Reserve 4 lines at bottom: blank, "Actions:" label, 2 action items
-    actions_height = 4
+    # Reserve lines at bottom: blank, "Actions:" label, one line per action
+    actions_height = 2 + len(ACTIONS)
     # footer takes 1 line, so usable bottom is max_y - 1
     chat_bottom = max_y - 1 - actions_height
     chat_width = max(20, max_x - 6)
@@ -1012,10 +1031,7 @@ def _draw_action_screen(stdscr, session, max_y, max_x, action_selected):
     # Action buttons - anchored to bottom
     y = max_y - 1 - actions_height
 
-    actions = [
-        ("Resume session", "r"),
-        ("View history", "h"),
-    ]
+    actions = ACTIONS
 
     if y < max_y - 1:
         try:
@@ -1024,7 +1040,7 @@ def _draw_action_screen(stdscr, session, max_y, max_x, action_selected):
             pass
         y += 1
 
-    for idx, (label, key) in enumerate(actions):
+    for idx, (label, key, _action) in enumerate(actions):
         if y < max_y - 1:
             if idx == action_selected:
                 attr = curses.color_pair(1) | curses.A_BOLD
@@ -1042,7 +1058,7 @@ def _draw_action_screen(stdscr, session, max_y, max_x, action_selected):
             y += 1
 
     # Footer
-    footer = " \u2191\u2193/jk:switch  Enter/r:resume  h:history  Esc:back "
+    footer = " \u2191\u2193/jk:switch  Enter/r:resume  f:fork  h:history  Esc:back "
     try:
         stdscr.addnstr(max_y - 1, 0, footer.ljust(max_x), max_x, curses.A_REVERSE)
     except curses.error:
@@ -1079,18 +1095,13 @@ def _curses_text_input(stdscr, prompt, max_y, max_x):
             buf += chr(key)
 
 
-# Actions returned from the UI
-ACTION_RESUME = "resume"
-ACTION_HISTORY = "history"
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Browse, search, and resume Claude Code sessions."
+        description="Browse, search, resume, and fork Claude Code sessions."
     )
     parser.add_argument("-n", type=int, default=0, metavar="N",
                         help="Limit to N results")
@@ -1104,6 +1115,8 @@ def main():
                         help="Jump directly to action screen for session ID")
     parser.add_argument("--history", action="store_true",
                         help="With --session, print history directly")
+    parser.add_argument("--fork", action="store_true",
+                        help="With --session, resume as a new forked session")
     parser.add_argument("--no-tools", action="store_true",
                         help="Hide tool use/result blocks in history output")
     parser.add_argument("--thinking", action="store_true",
@@ -1144,7 +1157,7 @@ def main():
             use_color = sys.stdout.isatty() and not args.no_color
             print_history(chosen, entries, use_color=use_color)
         else:
-            resume_session(chosen)
+            resume_session(chosen, fork=args.fork)
         return
 
     # JSON output mode
@@ -1244,18 +1257,15 @@ def main():
                 elif key in (curses.KEY_UP, ord("k")):
                     action_selected = max(0, action_selected - 1)
                 elif key in (curses.KEY_DOWN, ord("j")):
-                    action_selected = min(1, action_selected + 1)
+                    action_selected = min(len(ACTIONS) - 1, action_selected + 1)
                 elif key in (curses.KEY_ENTER, 10, 13):
-                    if action_selected == 0:
-                        return (chosen_session, ACTION_RESUME)
-                    else:
-                        return (chosen_session, ACTION_HISTORY)
-                elif key == ord("r"):
-                    return (chosen_session, ACTION_RESUME)
-                elif key == ord("h"):
-                    return (chosen_session, ACTION_HISTORY)
+                    return (chosen_session, ACTIONS[action_selected][2])
                 elif key == ord("q"):
                     return (None, None)
+                else:
+                    for _label, hotkey, action in ACTIONS:
+                        if key == ord(hotkey):
+                            return (chosen_session, action)
                 continue
 
             # List / search results
@@ -1353,6 +1363,8 @@ def main():
 
     if action == ACTION_RESUME:
         resume_session(session)
+    elif action == ACTION_FORK:
+        resume_session(session, fork=True)
     elif action == ACTION_HISTORY:
         entries = read_session_history(
             session,
